@@ -1,0 +1,172 @@
+Public Class parent
+    Dim up As Boolean
+    Dim dow As Boolean
+
+    Dim moveObjs As Integer = 4
+    Dim value As Integer
+    Dim whichObj As Integer
+
+    Dim objs(11) As PictureBox
+    Dim activeObjs(3) As PictureBox
+
+    Public Sub New()
+        InitializeComponent()
+        createArray()
+
+    End Sub
+
+    Private Sub createArray()
+        objs(0) = spriteMW1
+        objs(1) = spriteMW2
+        objs(2) = spriteIF1
+        objs(3) = spriteIF2
+        objs(4) = spriteAF1
+        objs(5) = spriteAF2
+        objs(6) = spriteMF1
+        objs(7) = spriteMF2
+        objs(8) = spriteCF1
+        objs(9) = spriteCF2
+        objs(10) = spriteIRS1
+        objs(11) = spriteIRS2
+        activeObjs(0) = spriteAF1
+        activeObjs(1) = spriteMF1
+        activeObjs(2) = spriteIRS1
+        activeObjs(3) = spriteIRS1
+
+    End Sub
+
+
+    Private Function getRandomStartLocationY()
+        Randomize()
+        Dim value As Integer = CInt(Int((625 * Rnd()) + 1))
+        Return value
+    End Function
+
+    Private Sub moveSprites()
+        For i = 0 To currentSlot + 1
+            activeObjs(i).Left = activeObjs(i).Left - 8
+            If activeObjs(i).Bounds.IntersectsWith(spriteDeeder.Bounds) Then
+                activeObjs(i).Visible = False
+                activeObjs(i).Left = activeObjs(i).Left + 1280
+                activeObjs(i).Top = 0
+            End If
+            If activeObjs(i).Right < 0 Then
+                activeObjs(i).Visible = False
+                activeObjs(i).Left = activeObjs(i).Left + 1280
+                activeObjs(i).Top = 0
+            End If
+        Next
+
+    End Sub
+
+    Private Function getRandomObjVal()
+        Randomize()
+        value = CInt(Int(11 * Rnd()))
+        Return value
+    End Function
+
+
+
+    Dim currentSlot As Integer = 0
+    Private Sub sendSprite()
+        Dim locValue As Integer = getRandomObjVal()
+        If objs(locValue).Visible = False And activeObjs(currentSlot).Visible = False Then
+            activeObjs(currentSlot) = objs(locValue)
+            activeObjs(currentSlot).Top = activeObjs(currentSlot).Top + getRandomStartLocationY()
+            activeObjs(currentSlot).Visible = True
+            currentSlot = currentSlot + 1
+            If currentSlot = 3 Then
+                currentSlot = 0
+            End If
+        End If
+    End Sub
+
+
+
+#Region "buttons"
+    Private Sub btnQuit_Click(sender As Object, e As EventArgs) Handles btnQuit.Click
+        Me.Close()
+    End Sub
+
+    Private Sub btnStart_Click(sender As Object, e As EventArgs) Handles btnStart.Click
+        GamePanel.Show()
+        Title.Hide()
+        btnStart.Hide()
+        btnQuit.Hide()
+        pictureDeeder.Hide()
+        pictureAmericanFactory.Hide()
+        pictureMW.Hide()
+
+        timerObj.Enabled = True
+        timerObj.Start()
+
+        moveDeeder.Enabled = True
+        moveDeeder.Start()
+
+        timerMoveObj.Enabled = True
+        timerMoveObj.Start()
+
+    End Sub
+#End Region
+
+#Region "Timers"
+
+    Private Sub moveComp_Tick(sender As Object, e As EventArgs) Handles moveDeeder.Tick
+        If up = True Then
+            If spriteDeeder.Top > -20 Then
+                spriteDeeder.Top = spriteDeeder.Top - 4
+            End If
+        End If
+        If dow = True Then
+            If spriteDeeder.Bottom < 705 Then
+                spriteDeeder.Top = spriteDeeder.Top + 4
+            End If
+        End If
+    End Sub
+
+
+
+    Private Sub objTimer_Tick(sender As Object, e As EventArgs) Handles timerObj.Tick
+        sendSprite()
+    End Sub
+    Private Sub moveObj_Tick(sender As Object, e As EventArgs) Handles timerMoveObj.Tick
+        moveSprites()
+    End Sub
+
+
+#End Region
+
+
+
+
+#Region "Keypresses"
+    Private Sub moveCompUp(sender As Object, e As KeyEventArgs) Handles MyBase.KeyDown
+        If e.KeyValue = Keys.Up Then
+            up = True
+        End If
+        If e.KeyValue = Keys.Down Then
+            dow = True
+        End If
+    End Sub
+
+    Private Sub moveCompStop(sender As Object, e As KeyEventArgs) Handles MyBase.KeyUp
+        If e.KeyValue = Keys.Up Then
+            up = False
+        End If
+        If e.KeyValue = Keys.Down Then
+            dow = False
+        End If
+
+    End Sub
+
+
+
+
+#End Region
+
+
+
+
+
+
+End Class

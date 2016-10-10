@@ -1,0 +1,26 @@
+ If i = 0 Or i = 7 Or i = 12 Then
+                        lblChanges.Text = bankAccount * -0.3
+                        bankAccount = bankAccount * 0.7
+                    ElseIf i = 1 Or i = 6 Or i = 9 Or i = 14 Then
+                        lblChanges.Text = "+45000"
+                        bankAccount = bankAccount + 45000
+                    ElseIf i = 2 Or i = 4 Or i = 10 Then
+                        lblChanges.Text = "+80000"
+                        bankAccount = bankAccount + 80000
+                    ElseIf i = 3 Or i = 11 Or i = 13 Then
+                        lblChanges.Text = "+20000"
+                        bankAccount = bankAccount + 20000
+                    ElseIf i = 8 Then
+                        lblChanges.Text = "+120000"
+                        bankAccount = bankAccount + 125000
+                    ElseIf i = 5 Then
+                        Randomize()
+                    Dim tempValue As Integer = CInt(Int((2 * Rnd()) + 1))
+                    If tempValue = 1 Then
+                        lblChanges.Text = bankAccount * 5
+                        bankAccount = bankAccount * 5
+                    ElseIf tempValue = 2 Then
+                        lblChanges.Text = 100 - bankAccount
+                        bankAccount = 100
+                    End If
+                    End If
