@@ -1,5 +1,9 @@
-//! Usage: bj [rounds=100000000] [threads=all] [seed=1] [hilo|basic]
+//! Usage: bj [rounds=100000000] [threads=all] [seed=1] [hilo|basic] [vec|ref]
+//! Games run in lanes (independent games with their own shoes), GROUPS x 16 lanes per set. `vec`
+//! runs them on the AVX-512 lockstep engine, `ref` on the scalar reference engine; results are
+//! identical, and the same for any thread count.
 use bj::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 fn report(s: &Stats) {
@@ -59,29 +63,60 @@ fn report(s: &Stats) {
     }
 }
 
+const GROUPS: usize = 3; // 16-lane groups interleaved per set (3 measured fastest)
+const NLANES: usize = GROUPS * 16;
+const SETS: u64 = 128; // independent lane sets: the unit of work handed to threads
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let rounds: u64 = args.get(1).map_or(100_000_000, |a| a.parse().expect("rounds"));
-    let threads: u64 = args
+    let threads: usize = args
         .get(2)
-        .map_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get() as u64), |a| a.parse().expect("threads"))
+        .map_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()), |a| a.parse().expect("threads"))
         .max(1);
     let seed: u64 = args.get(3).map_or(1, |a| a.parse().expect("seed"));
     let counting = args.get(4).map_or(true, |m| m != "basic");
+    let reference = args.get(5).is_some_and(|m| m == "ref") || !cfg!(target_feature = "avx512f");
 
-    let mut seeder = seed;
+    // The work is split into SETS independent lane sets with fixed seeds and round counts, handed
+    // out to threads dynamically, so a core slowed by other load doesn't hold up the run. Each
+    // set's result doesn't depend on which thread runs it, so output is the same for any thread
+    // count.
+    let next = AtomicU64::new(0);
     let t0 = Instant::now();
     let total = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|t| {
-                let n = rounds / threads + u64::from(t < rounds % threads);
-                let s = splitmix64(&mut seeder);
+            .map(|_| {
+                let next = &next;
                 scope.spawn(move || {
-                    let mut sim = Sim::new(s, counting);
-                    for _ in 0..n {
-                        sim.play_round();
+                    let mut total = Stats::default();
+                    loop {
+                        let set = next.fetch_add(1, Ordering::Relaxed);
+                        if set >= SETS {
+                            break;
+                        }
+                        let n = rounds / SETS + u64::from(set < rounds % SETS);
+                        let mut seeder = set_seed(seed, set);
+                        let mut lanes: Vec<Sim> = (0..NLANES).map(|_| Sim::new(splitmix64(&mut seeder), counting)).collect();
+                        let (per, extra) = (n / NLANES as u64, (n % NLANES as u64) as usize);
+                        if reference {
+                            for (l, sim) in lanes.iter_mut().enumerate() {
+                                for _ in 0..per + u64::from(l < extra) {
+                                    sim.play_round();
+                                }
+                            }
+                        } else {
+                            #[cfg(target_feature = "avx512f")]
+                            bj::engine::Engine::<GROUPS>::new(&mut lanes, counting).run(per);
+                            for sim in &mut lanes[..extra] {
+                                sim.play_round();
+                            }
+                        }
+                        for sim in &lanes {
+                            total.merge(&sim.st);
+                        }
                     }
-                    sim.st
+                    total
                 })
             })
             .collect();
@@ -99,7 +134,8 @@ fn main() {
     );
     report(&total);
     println!(
-        "time: Rust {} thread(s) {:.3} s, {:.1} M rounds/s, sim state {} bytes/thread",
+        "time: Rust {}, {} thread(s) {:.3} s, {:.1} M rounds/s, {} bytes/lane",
+        if reference { "scalar" } else { "avx512" },
         threads,
         secs,
         rounds as f64 / secs / 1e6,

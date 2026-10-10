@@ -2,8 +2,12 @@
 //! Rules: S17, DAS, late surrender, dealer peeks, split to 4 hands, split aces once
 //! (one card each, no resplit), 3:2 blackjack, insurance offered.
 //!
-//! Mirrors ../cpp/bj.hpp step for step, including the RNG and the order cards are drawn,
-//! so both produce identical results for the same seed.
+//! This is the scalar reference engine; engine.rs is the AVX-512 engine, which produces
+//! bit-identical results. Both mirror ../cpp step for step, including the RNG and the order
+//! cards are drawn, so C++ and Rust produce identical results for the same seed.
+
+#[cfg(target_feature = "avx512f")]
+pub mod engine;
 
 pub const DECKS: usize = 6;
 pub const CARDS: usize = DECKS * 52; // 312
@@ -17,7 +21,12 @@ pub const TC_BUCKETS: usize = (TC_MAX - TC_MIN + 1) as usize;
 pub const HILO: [i8; 11] = [0, -1, 1, 1, 1, 1, 1, 0, 0, 0, -1];
 
 // ---------------------------------------------------------------- RNG
-// xoshiro256** seeded by splitmix64; Lemire's unbiased bounded integers.
+// xoshiro256++ (Blackman & Vigna) in 8 independent streams stored structure-of-arrays, so one
+// refill is a few AVX-512 instructions (the 8 dependency chains run in parallel; a single
+// stream is a serial ~5-cycle-per-step chain). A refill makes 4 steps x 8 lanes = 32 outputs,
+// and both 32-bit halves of each are used: 64 words. Bounded integers use Lemire's multiply-
+// shift with rejection, one 32-bit word per value in the common case (never 64 random bits for
+// a value < 2^9: the "batched" idea of Brackett-Rozinsky & Lemire 2024).
 pub fn splitmix64(s: &mut u64) -> u64 {
     *s = s.wrapping_add(0x9E3779B97F4A7C15);
     let mut z = *s;
@@ -26,44 +35,102 @@ pub fn splitmix64(s: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Seed for lane set `set`: a splitmix64 hash of (seed, set). Lanes in a set then take successive
+/// splitmix64 outputs from it. Hashing matters: if set s started its chain at seed + s * golden,
+/// set s + 1 would reuse set s's lane seeds shifted by one, replaying the same games.
+pub fn set_seed(seed: u64, set: u64) -> u64 {
+    let mut s = seed ^ set.wrapping_mul(0xD1B54A32D192ED03);
+    splitmix64(&mut s);
+    splitmix64(&mut s)
+}
+
+pub const RNG_LANES: usize = 8;
+pub const RNG_STEPS: usize = 4;
+pub const RNG_BUF: usize = 2 * RNG_LANES * RNG_STEPS;
+
+#[derive(Clone)]
+#[repr(C, align(64))]
 pub struct Rng {
-    s: [u64; 4],
+    pub s: [[u64; RNG_LANES]; 4], // s[k][lane]
+    pub buf: [u32; RNG_BUF],
+    pub idx: usize,
 }
 
 impl Rng {
     pub fn new(mut seed: u64) -> Self {
-        let mut s = [0u64; 4];
-        for x in &mut s {
-            *x = splitmix64(&mut seed);
+        let mut s = [[0u64; RNG_LANES]; 4];
+        for l in 0..RNG_LANES {
+            for k in 0..4 {
+                s[k][l] = splitmix64(&mut seed);
+            }
         }
-        Rng { s }
+        Rng { s, buf: [0; RNG_BUF], idx: RNG_BUF }
+    }
+
+    /// Buffer order per step: the 8 high halves, then the 8 low halves.
+    pub fn refill(&mut self) {
+        #[cfg(target_feature = "avx512f")]
+        unsafe {
+            use std::arch::x86_64::*;
+            let p = |k: usize| self.s[k].as_ptr() as *const __m512i;
+            let (mut a, mut b, mut c, mut d) =
+                (_mm512_loadu_si512(p(0)), _mm512_loadu_si512(p(1)), _mm512_loadu_si512(p(2)), _mm512_loadu_si512(p(3)));
+            let hi_lo = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 0, 2, 4, 6, 8, 10, 12, 14);
+            for step in 0..RNG_STEPS {
+                let r = _mm512_add_epi64(_mm512_rol_epi64::<23>(_mm512_add_epi64(a, d)), a);
+                let t = _mm512_slli_epi64::<17>(b);
+                c = _mm512_xor_si512(c, a);
+                d = _mm512_xor_si512(d, b);
+                b = _mm512_xor_si512(b, c);
+                a = _mm512_xor_si512(a, d);
+                c = _mm512_xor_si512(c, t);
+                d = _mm512_rol_epi64::<45>(d);
+                // One 512-bit store per block so a 512-bit reload can be store-forwarded.
+                let out = self.buf.as_mut_ptr().add(step * 2 * RNG_LANES) as *mut __m512i;
+                _mm512_storeu_si512(out, _mm512_permutexvar_epi32(hi_lo, r));
+            }
+            for (k, v) in [a, b, c, d].into_iter().enumerate() {
+                _mm512_storeu_si512(self.s[k].as_mut_ptr() as *mut __m512i, v);
+            }
+        }
+        #[cfg(not(target_feature = "avx512f"))]
+        for step in 0..RNG_STEPS {
+            for l in 0..RNG_LANES {
+                let s = &mut self.s;
+                let r = s[0][l].wrapping_add(s[3][l]).rotate_left(23).wrapping_add(s[0][l]);
+                let t = s[1][l] << 17;
+                s[2][l] ^= s[0][l];
+                s[3][l] ^= s[1][l];
+                s[1][l] ^= s[2][l];
+                s[0][l] ^= s[3][l];
+                s[2][l] ^= t;
+                s[3][l] = s[3][l].rotate_left(45);
+                self.buf[step * 2 * RNG_LANES + l] = (r >> 32) as u32;
+                self.buf[step * 2 * RNG_LANES + RNG_LANES + l] = r as u32;
+            }
+        }
+        self.idx = 0;
     }
 
     #[inline(always)]
-    pub fn next(&mut self) -> u64 {
-        let s = &mut self.s;
-        let r = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
-        let t = s[1] << 17;
-        s[2] ^= s[0];
-        s[3] ^= s[1];
-        s[1] ^= s[2];
-        s[0] ^= s[3];
-        s[2] ^= t;
-        s[3] = s[3].rotate_left(45);
-        r
+    pub fn next32(&mut self) -> u32 {
+        if self.idx == RNG_BUF {
+            self.refill();
+        }
+        let w = self.buf[self.idx];
+        self.idx += 1;
+        w
     }
 
     /// Uniform in [0, range).
     #[inline(always)]
     pub fn below(&mut self, range: u32) -> u32 {
-        let mut x = self.next() >> 32;
-        let mut m = x * range as u64;
+        let mut m = self.next32() as u64 * range as u64;
         let mut l = m as u32;
         if l < range {
             let t = range.wrapping_neg() % range;
             while l < t {
-                x = self.next() >> 32;
-                m = x * range as u64;
+                m = self.next32() as u64 * range as u64;
                 l = m as u32;
             }
         }
@@ -72,17 +139,27 @@ impl Rng {
 }
 
 // ---------------------------------------------------------------- Shoe
-/// 312 bytes. Shuffling is lazy Fisher-Yates: each draw swaps a random undealt card into
-/// position `pos`. The array always stays a permutation of the full shoe, so a reshuffle is
-/// just `pos = 0` and only the 260 cards actually dealt are ever shuffled.
+// Pre-shuffled: a reshuffle runs Fisher-Yates over the first SHUF_EAGER positions at once, so
+// dealing is a plain array read and the RNG is off the game's critical path. A round that runs
+// past the shuffled prefix (only possible with splits) extends it one Fisher-Yates step at a
+// time; the card at each position is the same either way. A round starts at pos <= 259, and a
+// round without re-splits uses at most ~25 cards, so the vector engine never needs to extend.
+// Each shoe owns its RNG, so its card sequence depends only on its seed.
+pub const SHUF_EAGER: usize = 288;
+pub const SHOE_BYTES: usize = 320; // padded so 4-byte reads near the end stay in bounds
+
+#[derive(Clone)]
+#[repr(C, align(64))]
 pub struct Shoe {
-    pub cards: [u8; CARDS],
+    pub cards: [u8; SHOE_BYTES],
     pub pos: usize,
+    pub shuffled: usize,
+    pub rng: Rng,
 }
 
-impl Default for Shoe {
-    fn default() -> Self {
-        let mut cards = [0u8; CARDS];
+impl Shoe {
+    pub fn new(seed: u64) -> Self {
+        let mut cards = [0u8; SHOE_BYTES];
         let mut i = 0;
         for _ in 0..DECKS * 4 {
             for r in 1..=13u8 {
@@ -90,15 +167,78 @@ impl Default for Shoe {
                 i += 1;
             }
         }
-        Shoe { cards, pos: 0 }
+        let mut s = Shoe { cards, pos: 0, shuffled: 0, rng: Rng::new(seed) };
+        s.shuffle();
+        s
     }
-}
 
-impl Shoe {
+    pub fn fy_step(&mut self, i: usize) {
+        let j = i + self.rng.below((CARDS - i) as u32) as usize;
+        self.cards.swap(i, j);
+    }
+
+    /// Same result as `for i < SHUF_EAGER: fy_step(i)`. The swap targets depend only on the RNG
+    /// stream, not on the swaps, so they are all computed first: 16 at a time with one vector
+    /// multiply whenever the buffer holds an aligned block of 16 words and none of them can hit
+    /// Lemire's rejection zone (probability ~1e-6 per block), else one at a time via below().
+    pub fn shuffle(&mut self) {
+        let mut jt = [0u16; SHUF_EAGER];
+        let mut i = 0;
+        #[cfg(target_feature = "avx512f")]
+        unsafe {
+            use std::arch::x86_64::*;
+            let lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+            while i + 16 <= SHUF_EAGER {
+                if self.rng.idx == RNG_BUF {
+                    self.rng.refill();
+                }
+                if self.rng.idx & 15 != 0 {
+                    // unaligned after a scalar step: realign one word at a time
+                    jt[i] = (i + self.rng.below((CARDS - i) as u32) as usize) as u16;
+                    i += 1;
+                    continue;
+                }
+                let first = _mm512_add_epi32(_mm512_set1_epi32(i as i32), lane);
+                let range = _mm512_sub_epi32(_mm512_set1_epi32(CARDS as i32), first);
+                let w = _mm512_loadu_si512(self.rng.buf.as_ptr().add(self.rng.idx) as *const __m512i);
+                let me = _mm512_mul_epu32(w, range); // even lanes: 64-bit products
+                let mo = _mm512_mul_epu32(_mm512_srli_epi64::<32>(w), _mm512_srli_epi64::<32>(range));
+                let hi = _mm512_mask_blend_epi32(0xAAAA, _mm512_srli_epi64::<32>(me), mo);
+                let lo = _mm512_mask_blend_epi32(0xAAAA, me, _mm512_slli_epi64::<32>(mo));
+                if _mm512_cmplt_epu32_mask(lo, range) != 0 {
+                    // possible rejection: exact scalar path
+                    for _ in 0..16 {
+                        jt[i] = (i + self.rng.below((CARDS - i) as u32) as usize) as u16;
+                        i += 1;
+                    }
+                    continue;
+                }
+                // Unaligned store: i is not a multiple of 16 after a scalar realignment step.
+                _mm256_storeu_si256(jt.as_mut_ptr().add(i) as *mut __m256i, _mm512_cvtepi32_epi16(_mm512_add_epi32(first, hi)));
+                self.rng.idx += 16;
+                i += 16;
+            }
+        }
+        while i < SHUF_EAGER {
+            jt[i] = (i + self.rng.below((CARDS - i) as u32) as usize) as u16;
+            i += 1;
+        }
+        for (i, &j) in jt.iter().enumerate() {
+            // load both before storing: fewer store-forwarding stalls
+            let (x, y) = (self.cards[i], self.cards[j as usize]);
+            self.cards[i] = y;
+            self.cards[j as usize] = x;
+        }
+        self.shuffled = SHUF_EAGER;
+        self.pos = 0;
+    }
+
     #[inline(always)]
-    pub fn draw(&mut self, rng: &mut Rng) -> u8 {
-        let j = self.pos + rng.below((CARDS - self.pos) as u32) as usize;
-        self.cards.swap(self.pos, j);
+    pub fn draw(&mut self) -> u8 {
+        if self.pos >= self.shuffled {
+            self.fy_step(self.shuffled);
+            self.shuffled += 1;
+        }
         let c = self.cards[self.pos];
         self.pos += 1;
         c
@@ -163,7 +303,7 @@ use Action::*;
 
 // ---------------------------------------------------------------- Stats
 /// Money is tracked in half-units so 3:2, insurance and surrender stay integral.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Stats {
     pub rounds: u64,
     pub hands: u64,
@@ -244,6 +384,14 @@ pub struct Table {
     e: [[[Entry; NFLAGS]; 11]; NCLASS],
 }
 
+impl Table {
+    /// (base action, deviation action, index) for a hand class, upcard and rule flags.
+    pub fn entry(&self, cls: usize, up: usize, flags: usize) -> (u8, u8, i8) {
+        let e = self.e[cls][up][flags];
+        (e.base as u8, e.alt as u8, e.k)
+    }
+}
+
 #[inline(always)]
 fn hand_class(h: &Hand) -> usize {
     let (pair, soft, hard) = (31 + h.first as usize, 20 + h.sum as usize, h.sum as usize);
@@ -297,8 +445,8 @@ pub fn strategy_table(counting: bool) -> &'static Table {
 }
 
 // ---------------------------------------------------------------- Player
+#[derive(Clone)]
 pub struct Sim {
-    pub rng: Rng,
     pub shoe: Shoe,
     pub rc: i32,           // Hi-Lo running count
     pub unseen_extra: i32, // 1 while the dealer's hole card is drawn but not yet seen
@@ -313,7 +461,7 @@ impl Sim {
     }
 
     fn with_table(seed: u64, counting: bool, table: Option<&'static Table>) -> Self {
-        Sim { rng: Rng::new(seed), shoe: Shoe::default(), rc: 0, unseen_extra: 0, counting, st: Stats::default(), table }
+        Sim { shoe: Shoe::new(seed), rc: 0, unseen_extra: 0, counting, st: Stats::default(), table }
     }
 
     /// Table-driven equivalent of decide().
@@ -343,7 +491,7 @@ impl Sim {
 
     #[inline(always)]
     fn draw_seen(&mut self) -> u8 {
-        let c = self.shoe.draw(&mut self.rng);
+        let c = self.shoe.draw();
         self.rc += HILO[c as usize] as i32;
         c
     }
@@ -441,7 +589,7 @@ impl Sim {
 
     pub fn play_round(&mut self) {
         if self.shoe.pos >= CUT {
-            self.shoe.pos = 0;
+            self.shoe.shuffle();
             self.rc = 0;
             self.st.shuffles += 1;
         }
@@ -460,7 +608,7 @@ impl Sim {
         let up = self.draw_seen();
         let c = self.draw_seen();
         hands[0].add(c);
-        let hole = self.shoe.draw(&mut self.rng);
+        let hole = self.shoe.draw();
         self.unseen_extra = 1;
 
         let dealer_bj = (up == 1 && hole == 10) || (up == 10 && hole == 1);
@@ -626,43 +774,134 @@ mod tests {
         s
     }
 
-    #[test]
-    fn shoe_composition_and_balance() {
-        let sh = Shoe::default();
-        let mut counts = [0; 11];
-        let mut sum = 0i32;
-        for &c in &sh.cards {
-            counts[c as usize] += 1;
-            sum += HILO[c as usize] as i32;
+    fn same_rng(a: &Rng, b: &Rng) -> bool {
+        a.s == b.s && a.idx == b.idx && a.buf[a.idx..] == b.buf[b.idx..]
+    }
+
+    /// Reference definition of a shuffle: textbook Fisher-Yates, one bounded draw per position.
+    fn reference_shuffle(s: &mut Shoe) {
+        for i in 0..SHUF_EAGER {
+            s.fy_step(i);
         }
-        assert!(counts[1..=9].iter().all(|&n| n == 24));
-        assert_eq!(counts[10], 96);
-        assert_eq!(sum, 0);
+        s.shuffled = SHUF_EAGER;
+        s.pos = 0;
     }
 
     #[test]
-    fn lazy_shuffle_keeps_permutation() {
-        let mut sh = Shoe::default();
-        let mut rng = Rng::new(7);
-        for _ in 0..1000 {
-            sh.pos = 0;
-            let mut counts = [0; 11];
-            for _ in 0..CARDS {
-                counts[sh.draw(&mut rng) as usize] += 1;
+    fn rng_refill_matches_scalar_xoshiro() {
+        let (mut r, mut s) = (Rng::new(42), Rng::new(42).s);
+        for _ in 0..10 {
+            r.refill();
+            for step in 0..RNG_STEPS {
+                for l in 0..RNG_LANES {
+                    let out = s[0][l].wrapping_add(s[3][l]).rotate_left(23).wrapping_add(s[0][l]);
+                    let t = s[1][l] << 17;
+                    s[2][l] ^= s[0][l];
+                    s[3][l] ^= s[1][l];
+                    s[1][l] ^= s[2][l];
+                    s[0][l] ^= s[3][l];
+                    s[2][l] ^= t;
+                    s[3][l] = s[3][l].rotate_left(45);
+                    assert_eq!(r.buf[step * 16 + l], (out >> 32) as u32);
+                    assert_eq!(r.buf[step * 16 + 8 + l], out as u32);
+                }
             }
-            assert!(counts[1..=9].iter().all(|&n| n == 24));
-            assert_eq!(counts[10], 96);
         }
     }
 
     #[test]
-    fn rng_bounded_uniform_and_matches_reference() {
+    fn lane_seeds_never_repeat_across_sets() {
+        let mut seen = std::collections::HashSet::new();
+        for seed in [1u64, 2] {
+            for set in 0..128 {
+                let mut seeder = set_seed(seed, set);
+                for _ in 0..48 {
+                    assert!(seen.insert(splitmix64(&mut seeder)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rng_bounded_uniform() {
         let mut rng = Rng::new(3);
         let mut b = [0; 13];
         for _ in 0..1_300_000 {
             b[rng.below(13) as usize] += 1;
         }
         assert!(b.iter().all(|&x| x > 99_000 && x < 101_000));
+    }
+
+    #[test]
+    fn shoe_composition_and_balance() {
+        let mut sh = Shoe::new(9);
+        for _ in 0..1000 {
+            let mut counts = [0; 11];
+            let mut sum = 0i32;
+            for &c in &sh.cards[..CARDS] {
+                counts[c as usize] += 1;
+                sum += HILO[c as usize] as i32;
+            }
+            assert!(counts[1..=9].iter().all(|&n| n == 24));
+            assert_eq!(counts[10], 96);
+            assert_eq!(sum, 0);
+            sh.shuffle();
+        }
+    }
+
+    #[test]
+    fn vector_shuffle_matches_textbook_fisher_yates() {
+        // From misaligned RNG positions, and with blocks forced onto the exact rejection path.
+        for skew in 0..40 {
+            let mut a = Shoe::new(100 + skew as u64);
+            for _ in 0..skew {
+                a.rng.next32();
+            }
+            if skew >= 20 {
+                let i = a.rng.idx;
+                for w in &mut a.rng.buf[i..] {
+                    *w &= 0xFF;
+                }
+            }
+            let mut b = a.clone();
+            a.shuffle();
+            reference_shuffle(&mut b);
+            assert_eq!(a.cards, b.cards, "skew {skew}");
+            assert!(same_rng(&a.rng, &b.rng), "skew {skew}");
+        }
+    }
+
+    #[test]
+    fn extension_continues_fisher_yates() {
+        let (mut a, mut b) = (Shoe::new(5), Shoe::new(5));
+        for i in SHUF_EAGER..CARDS {
+            b.fy_step(i);
+        }
+        a.pos = SHUF_EAGER;
+        for i in SHUF_EAGER..CARDS {
+            assert_eq!(a.draw(), b.cards[i]);
+        }
+    }
+
+    #[test]
+    fn positions_uniform_over_ranks() {
+        // Chi-square, 9 degrees of freedom; the 99.99% critical value is 33.7.
+        const SHOES: usize = 60_000;
+        for p in [0usize, 1, 100, 259, 287] {
+            let mut sh = Shoe::new(77 + p as u64);
+            let mut counts = [0f64; 11];
+            for _ in 0..SHOES {
+                sh.shuffle();
+                counts[sh.cards[p] as usize] += 1.0;
+            }
+            let chi: f64 = (1..=10)
+                .map(|r| {
+                    let e = SHOES as f64 * if r == 10 { 96.0 } else { 24.0 } / CARDS as f64;
+                    (counts[r] - e).powi(2) / e
+                })
+                .sum();
+            assert!(chi < 33.7, "position {p}: chi-square {chi:.1}");
+        }
     }
 
     #[test]
@@ -737,10 +976,11 @@ mod tests {
     fn table_matches_decide_in_play() {
         for counting in [true, false] {
             let mut s = Sim::new(5, counting);
+            let mut r = Rng::new(6);
             for _ in 0..20_000 {
                 s.play_round();
-                let up = (s.rng.below(10) + 1) as u8;
-                let h = Hand::from(&[(s.rng.below(10) + 1) as u8, (s.rng.below(10) + 1) as u8]);
+                let up = (r.below(10) + 1) as u8;
+                let h = Hand::from(&[(r.below(10) + 1) as u8, (r.below(10) + 1) as u8]);
                 for f in 0..8 {
                     let (d, p, u) = (f & 1 != 0, f & 2 != 0, f & 4 != 0);
                     assert_eq!(s.lookup(&h, up, d, p, u), s.decide(&h, up, d, p, u));
@@ -767,5 +1007,57 @@ mod tests {
             assert_eq!(rc, s.rc);
         }
         assert_eq!(s.st.rounds, 200_000);
+    }
+
+    /// Engine<G> must match independent scalar Sims exactly, lane by lane.
+    #[cfg(target_feature = "avx512f")]
+    fn check_engine<const G: usize>(mut seed: u64, counting: bool, rounds: u64, extra: usize) {
+        let mut vec: Vec<Sim> = (0..G * 16).map(|_| Sim::new(splitmix64(&mut seed), counting)).collect();
+        let mut reference = vec.clone();
+        engine::Engine::<G>::new(&mut vec, counting).run(rounds);
+        for s in &mut vec[..extra] {
+            s.play_round();
+        }
+        for (l, s) in reference.iter_mut().enumerate() {
+            for _ in 0..rounds + u64::from(l < extra) {
+                s.play_round();
+            }
+        }
+        for (a, b) in vec.iter().zip(&reference) {
+            assert_eq!(a.st, b.st);
+            assert_eq!((a.shoe.pos, a.rc, a.shoe.shuffled), (b.shoe.pos, b.rc, b.shoe.shuffled));
+            assert_eq!(a.shoe.cards, b.shoe.cards);
+            assert!(same_rng(&a.shoe.rng, &b.shoe.rng));
+        }
+        assert!(reference.iter().map(|s| s.st.splits).sum::<u64>() > 0);
+    }
+
+    #[cfg(target_feature = "avx512f")]
+    #[test]
+    fn vector_engine_matches_reference() {
+        check_engine::<1>(1, true, 20_000, 0);
+        check_engine::<1>(2, false, 20_000, 7);
+        check_engine::<3>(3, true, 6_000, 13);
+        check_engine::<3>(4, false, 6_000, 0);
+    }
+
+    #[cfg(target_feature = "avx512f")]
+    #[test]
+    fn edges_are_plausible() {
+        // Flat-bet basic strategy loses close to the published house edge for these rules
+        // (~0.35-0.40%); the Hi-Lo spread player wins. 20M rounds: CI about +/-0.05%.
+        let edge = |counting: bool| {
+            let mut seed = if counting { 21 } else { 22 };
+            let mut lanes: Vec<Sim> = (0..48).map(|_| Sim::new(splitmix64(&mut seed), counting)).collect();
+            engine::Engine::<3>::new(&mut lanes, counting).run(20_000_000 / 48);
+            let mut t = Stats::default();
+            for s in &lanes {
+                t.merge(&s.st);
+            }
+            100.0 * t.net as f64 / t.initial_bet as f64
+        };
+        let (basic, hilo) = (edge(false), edge(true));
+        assert!(basic > -0.50 && basic < -0.25, "basic {basic}");
+        assert!(hilo > 0.8 && hilo < 1.6, "hilo {hilo}");
     }
 }

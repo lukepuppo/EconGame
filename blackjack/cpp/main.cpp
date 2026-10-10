@@ -1,4 +1,8 @@
-// Usage: bj [rounds=100000000] [threads=all] [seed=1] [hilo|basic]
+// Usage: bj [rounds=100000000] [threads=all] [seed=1] [hilo|basic] [vec|ref]
+// Games run in lanes (independent games with their own shoes), GROUPS x 16 lanes per set. `vec`
+// runs them on the AVX-512 lockstep engine, `ref` on the scalar reference engine; results are
+// identical, and the same for any thread count.
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -7,9 +11,15 @@
 #include <thread>
 #include <vector>
 
-#include "bj.hpp"
+#include "engine.hpp"
 
 using namespace bj;
+
+#ifndef GROUPS
+#define GROUPS 3  // 16-lane groups interleaved per thread (3 measured fastest)
+#endif
+constexpr int NLANES = GROUPS * VLANES;
+constexpr int SETS = 128;  // independent lane sets: the unit of work handed to threads
 
 static void report(const Stats& s) {
     double n = (double)s.rounds;
@@ -51,19 +61,41 @@ int main(int argc, char** argv) {
     unsigned threads = argc > 2 ? (unsigned)atoi(argv[2]) : std::thread::hardware_concurrency();
     uint64_t seed = argc > 3 ? strtoull(argv[3], nullptr, 10) : 1;
     bool counting = !(argc > 4 && strcmp(argv[4], "basic") == 0);
+    bool reference = argc > 5 && strcmp(argv[5], "ref") == 0;
+#ifndef __AVX512F__
+    reference = true;  // no AVX-512: scalar engine only
+#endif
     if (threads == 0) threads = 1;
 
-    std::vector<Stats> results(threads);
+    // The work is split into SETS independent lane sets with fixed seeds and round counts, handed
+    // out to threads dynamically, so a core slowed by other load doesn't hold up the run. Each
+    // set's result doesn't depend on which thread runs it, so output is the same for any thread
+    // count.
+    std::vector<Stats> results(SETS);
     std::vector<std::thread> pool;
-    uint64_t seeder = seed;
+    std::atomic<int> next{0};
     auto t0 = std::chrono::steady_clock::now();
     for (unsigned t = 0; t < threads; t++) {
-        uint64_t n = rounds / threads + (t < rounds % threads ? 1 : 0);
-        uint64_t s = splitmix64(seeder);
-        pool.emplace_back([&results, t, n, s, counting] {
-            Sim sim(s, counting);
-            for (uint64_t i = 0; i < n; i++) sim.play_round();
-            results[t] = sim.st;
+        pool.emplace_back([&] {
+            std::vector<Sim> lanes;
+            lanes.reserve(NLANES);
+            for (int set; (set = next.fetch_add(1)) < SETS;) {
+                uint64_t n = rounds / SETS + ((uint64_t)set < rounds % SETS);
+                uint64_t seeder = set_seed(seed, (uint64_t)set);
+                lanes.clear();
+                for (int l = 0; l < NLANES; l++) lanes.emplace_back(splitmix64(seeder), counting);
+                uint64_t per = n / NLANES, extra = n % NLANES;
+                if (reference) {
+                    for (int l = 0; l < NLANES; l++)
+                        for (uint64_t i = 0; i < per + (l < (int)extra); i++) lanes[l].play_round();
+                } else {
+#ifdef __AVX512F__
+                    Engine<GROUPS>(lanes.data(), counting).run(per);
+#endif
+                    for (uint64_t l = 0; l < extra; l++) lanes[l].play_round();
+                }
+                for (auto& sim : lanes) results[set].merge(sim.st);
+            }
         });
     }
     for (auto& th : pool) th.join();
@@ -73,6 +105,6 @@ int main(int argc, char** argv) {
     for (auto& r : results) total.merge(r);
     printf("mode                %s\n", counting ? "hi-lo (I18 + Fab 4, 1-12 spread)" : "basic strategy, flat bet");
     report(total);
-    printf("time: C++ %u thread(s) %.3f s, %.1f M rounds/s, sim state %zu bytes/thread\n", threads, secs,
-           rounds / secs / 1e6, sizeof(Sim));
+    printf("time: C++ %s, %u thread(s) %.3f s, %.1f M rounds/s, %zu bytes/lane\n",
+           reference ? "scalar" : "avx512", threads, secs, rounds / secs / 1e6, sizeof(Sim));
 }

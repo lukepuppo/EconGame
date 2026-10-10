@@ -2,12 +2,16 @@
 // Rules: S17, DAS, late surrender, dealer peeks, split to 4 hands, split aces once
 // (one card each, no resplit), 3:2 blackjack, insurance offered.
 //
-// The Rust port (../rust/src/lib.rs) mirrors this file step for step, including the RNG
-// and the order cards are drawn, so both produce identical results for the same seed.
+// This is the scalar reference engine; engine.hpp is the AVX-512 engine, which must produce
+// bit-identical results. The Rust port (../rust/src/lib.rs) mirrors both step for step,
+// including the RNG and the order cards are drawn, so all produce identical results.
 #pragma once
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#ifdef __AVX512F__
+#include <immintrin.h>
+#endif
 
 namespace bj {
 
@@ -21,7 +25,13 @@ constexpr int TC_MIN = -10, TC_MAX = 10, TC_BUCKETS = TC_MAX - TC_MIN + 1;
 constexpr int8_t HILO[11] = {0, -1, 1, 1, 1, 1, 1, 0, 0, 0, -1};
 
 // ---------------------------------------------------------------- RNG
-// xoshiro256** seeded by splitmix64; Lemire's unbiased bounded integers.
+// xoshiro256++ (Blackman & Vigna) in 8 independent streams stored structure-of-arrays, so one
+// refill is a few AVX-512 instructions (the 8 dependency chains run in parallel; a single
+// stream is a serial ~5-cycle-per-step chain). The ++ scrambler needs no multiply (GCC lowers
+// 64-bit vector multiplies to the slow vpmullq). A refill makes 4 steps x 8 lanes = 32 outputs,
+// and both 32-bit halves of each are used: 64 words. Bounded integers use Lemire's multiply-
+// shift with rejection, one 32-bit word per value in the common case (never 64 random bits for
+// a value < 2^9: the "batched" idea of Brackett-Rozinsky & Lemire 2024).
 inline uint64_t splitmix64(uint64_t& s) {
     uint64_t z = (s += 0x9E3779B97F4A7C15ull);
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
@@ -29,30 +39,73 @@ inline uint64_t splitmix64(uint64_t& s) {
     return z ^ (z >> 31);
 }
 
+// Seed for lane set `set`: a splitmix64 hash of (seed, set). Lanes in a set then take successive
+// splitmix64 outputs from it. Hashing matters: if set s started its chain at seed + s * golden,
+// set s + 1 would reuse set s's lane seeds shifted by one, replaying the same games.
+inline uint64_t set_seed(uint64_t seed, uint64_t set) {
+    uint64_t s = seed ^ (set * 0xD1B54A32D192ED03ull);
+    splitmix64(s);
+    return splitmix64(s);
+}
+
+constexpr int RNG_LANES = 8, RNG_STEPS = 4, RNG_BUF = 2 * RNG_LANES * RNG_STEPS;
+
 struct Rng {
-    uint64_t s[4];
+    alignas(64) uint64_t s0[RNG_LANES], s1[RNG_LANES], s2[RNG_LANES], s3[RNG_LANES];
+    alignas(64) uint32_t buf[RNG_BUF];
+    int idx = RNG_BUF;
+
     explicit Rng(uint64_t seed) {
-        for (auto& x : s) x = splitmix64(seed);
+        for (int l = 0; l < RNG_LANES; l++) {
+            s0[l] = splitmix64(seed); s1[l] = splitmix64(seed);
+            s2[l] = splitmix64(seed); s3[l] = splitmix64(seed);
+        }
     }
     static uint64_t rotl(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
-    uint64_t next() {
-        uint64_t r = rotl(s[1] * 5, 7) * 9;
-        uint64_t t = s[1] << 17;
-        s[2] ^= s[0]; s[3] ^= s[1]; s[1] ^= s[2]; s[0] ^= s[3];
-        s[2] ^= t;
-        s[3] = rotl(s[3], 45);
-        return r;
+
+    // Buffer order per step: the 8 high halves, then the 8 low halves.
+    void refill() {
+#ifdef __AVX512F__
+        __m512i a = _mm512_load_si512(s0), b = _mm512_load_si512(s1), c = _mm512_load_si512(s2), d = _mm512_load_si512(s3);
+        const __m512i hi_lo = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 0, 2, 4, 6, 8, 10, 12, 14);
+        for (int step = 0; step < RNG_STEPS; step++) {
+            __m512i r = _mm512_add_epi64(_mm512_rol_epi64(_mm512_add_epi64(a, d), 23), a);
+            __m512i t = _mm512_slli_epi64(b, 17);
+            c = _mm512_xor_si512(c, a); d = _mm512_xor_si512(d, b); b = _mm512_xor_si512(b, c); a = _mm512_xor_si512(a, d);
+            c = _mm512_xor_si512(c, t);
+            d = _mm512_rol_epi64(d, 45);
+            // One 512-bit store per block so a 512-bit reload can be store-forwarded.
+            _mm512_store_si512(buf + step * 2 * RNG_LANES, _mm512_permutexvar_epi32(hi_lo, r));
+        }
+        _mm512_store_si512(s0, a); _mm512_store_si512(s1, b); _mm512_store_si512(s2, c); _mm512_store_si512(s3, d);
+#else
+        for (int step = 0; step < RNG_STEPS; step++) {
+            uint32_t* out = buf + step * 2 * RNG_LANES;
+            for (int l = 0; l < RNG_LANES; l++) {
+                uint64_t r = rotl(s0[l] + s3[l], 23) + s0[l];
+                uint64_t t = s1[l] << 17;
+                s2[l] ^= s0[l]; s3[l] ^= s1[l]; s1[l] ^= s2[l]; s0[l] ^= s3[l];
+                s2[l] ^= t;
+                s3[l] = rotl(s3[l], 45);
+                out[l] = (uint32_t)(r >> 32);
+                out[RNG_LANES + l] = (uint32_t)r;
+            }
+        }
+#endif
+        idx = 0;
+    }
+    uint32_t next32() {
+        if (idx == RNG_BUF) refill();
+        return buf[idx++];
     }
     // Uniform in [0, range).
     uint32_t below(uint32_t range) {
-        uint64_t x = next() >> 32;
-        uint64_t m = x * range;
+        uint64_t m = (uint64_t)next32() * range;
         uint32_t l = (uint32_t)m;
         if (l < range) {
             uint32_t t = (uint32_t)(-range) % range;
             while (l < t) {
-                x = next() >> 32;
-                m = x * range;
+                m = (uint64_t)next32() * range;
                 l = (uint32_t)m;
             }
         }
@@ -61,23 +114,77 @@ struct Rng {
 };
 
 // ---------------------------------------------------------------- Shoe
-// 312 bytes. Shuffling is lazy Fisher-Yates: each draw swaps a random undealt card into
-// position `pos`. The array always stays a permutation of the full shoe, so a reshuffle is
-// just `pos = 0` and only the 260 cards actually dealt are ever shuffled.
+// Pre-shuffled: a reshuffle runs Fisher-Yates over the first SHUF_EAGER positions at once, so
+// dealing is a plain array read and the RNG is off the game's critical path. A round that runs
+// past the shuffled prefix (only possible with splits) extends it one Fisher-Yates step at a
+// time; the card at each position is the same either way. A round starts at pos <= 259, and a
+// round without re-splits uses at most ~25 cards, so the vector engine never needs to extend.
+// Each shoe owns its RNG, so its card sequence depends only on its seed.
+constexpr int SHUF_EAGER = 288, SHOE_BYTES = 320;  // padded so 4-byte reads near the end stay in bounds
+
 struct Shoe {
-    uint8_t cards[CARDS];
-    int pos = 0;
-    Shoe() {
+    alignas(64) uint8_t cards[SHOE_BYTES] = {};
+    int pos = 0, shuffled = 0;
+    Rng rng;
+
+    explicit Shoe(uint64_t seed) : rng(seed) {
         int i = 0;
         for (int d = 0; d < DECKS * 4; d++)
             for (int r = 1; r <= 13; r++) cards[i++] = (uint8_t)(r > 10 ? 10 : r);
+        shuffle();
     }
-    uint8_t draw(Rng& rng) {
-        int j = pos + (int)rng.below((uint32_t)(CARDS - pos));
+    void fy_step(int i) {
+        int j = i + (int)rng.below((uint32_t)(CARDS - i));
         uint8_t c = cards[j];
-        cards[j] = cards[pos];
-        cards[pos++] = c;
-        return c;
+        cards[j] = cards[i];
+        cards[i] = c;
+    }
+    // Same result as `for i < SHUF_EAGER: fy_step(i)`. The swap targets depend only on the RNG
+    // stream, not on the swaps, so they are all computed first: 16 at a time with one vector
+    // multiply whenever the buffer holds an aligned block of 16 words and none of them can hit
+    // Lemire's rejection zone (probability ~1e-6 per block), else one at a time via below().
+    void shuffle() {
+        alignas(64) uint16_t J[SHUF_EAGER];
+        int i = 0;
+#ifdef __AVX512F__
+        const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        while (i + 16 <= SHUF_EAGER) {
+            if (rng.idx == RNG_BUF) rng.refill();
+            if (rng.idx & 15) {  // unaligned after a scalar step: realign one word at a time
+                J[i] = (uint16_t)(i + rng.below((uint32_t)(CARDS - i)));
+                i++;
+                continue;
+            }
+            __m512i first = _mm512_add_epi32(_mm512_set1_epi32(i), lane);
+            __m512i range = _mm512_sub_epi32(_mm512_set1_epi32(CARDS), first);
+            __m512i w = _mm512_load_si512(rng.buf + rng.idx);
+            __m512i me = _mm512_mul_epu32(w, range);  // even lanes: 64-bit products
+            __m512i mo = _mm512_mul_epu32(_mm512_srli_epi64(w, 32), _mm512_srli_epi64(range, 32));
+            __m512i hi = _mm512_mask_blend_epi32(0xAAAA, _mm512_srli_epi64(me, 32), mo);
+            __m512i lo = _mm512_mask_blend_epi32(0xAAAA, me, _mm512_slli_epi64(mo, 32));
+            if (_mm512_cmplt_epu32_mask(lo, range)) {  // possible rejection: exact scalar path
+                for (int end = i + 16; i < end; i++) J[i] = (uint16_t)(i + rng.below((uint32_t)(CARDS - i)));
+                continue;
+            }
+            // Unaligned store: i is not a multiple of 16 after a scalar realignment step.
+            _mm256_storeu_si256((__m256i*)(J + i), _mm512_cvtepi32_epi16(_mm512_add_epi32(first, hi)));
+            rng.idx += 16;
+            i += 16;
+        }
+#endif
+        for (; i < SHUF_EAGER; i++) J[i] = (uint16_t)(i + rng.below((uint32_t)(CARDS - i)));
+        for (i = 0; i < SHUF_EAGER; i++) {  // load both before storing: fewer store-forwarding stalls
+            int j = J[i];
+            uint8_t x = cards[i], y = cards[j];
+            cards[i] = y;
+            cards[j] = x;
+        }
+        shuffled = SHUF_EAGER;
+        pos = 0;
+    }
+    uint8_t draw() {
+        if (pos >= shuffled) fy_step(shuffled++);
+        return cards[pos++];
     }
 };
 
@@ -164,7 +271,6 @@ inline int hand_class(const Hand& h) {
 
 // ---------------------------------------------------------------- Player
 struct Sim {
-    Rng rng;
     Shoe shoe;
     int rc = 0;             // Hi-Lo running count
     int unseen_extra = 0;   // 1 while the dealer's hole card is drawn but not yet seen
@@ -173,7 +279,7 @@ struct Sim {
     const Table* table;
 
     explicit Sim(uint64_t seed, bool counting_ = true, bool with_table = true)
-        : rng(seed), counting(counting_), table(with_table ? &strategy_table(counting_) : nullptr) {}
+        : shoe(seed), counting(counting_), table(with_table ? &strategy_table(counting_) : nullptr) {}
 
     // Table-driven equivalent of decide().
     Action lookup(const Hand& h, int up, bool can_double, bool can_split, bool can_surrender) const {
@@ -189,7 +295,7 @@ struct Sim {
     bool idx(int k, bool basic) const { return counting ? tc_ge(k) : basic; }
 
     uint8_t draw_seen() {
-        uint8_t c = shoe.draw(rng);
+        uint8_t c = shoe.draw();
         rc += HILO[c];
         return c;
     }
@@ -265,7 +371,7 @@ struct Sim {
 
     void play_round() {
         if (shoe.pos >= CUT) {
-            shoe.pos = 0;
+            shoe.shuffle();
             rc = 0;
             st.shuffles++;
         }
@@ -282,7 +388,7 @@ struct Sim {
         hands[0].add(draw_seen());
         uint8_t up = draw_seen();
         hands[0].add(draw_seen());
-        uint8_t hole = shoe.draw(rng);
+        uint8_t hole = shoe.draw();
         unseen_extra = 1;
 
         bool dealer_bj = (up == 1 && hole == 10) || (up == 10 && hole == 1);
