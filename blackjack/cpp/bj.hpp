@@ -6,6 +6,7 @@
 // and the order cards are drawn, so both produce identical results for the same seed.
 #pragma once
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 namespace bj {
@@ -96,8 +97,8 @@ struct Hand {
         ace |= (c == 1);
         ncards++;
     }
-    bool soft() const { return ace && sum <= 11; }
-    int value() const { return soft() ? sum + 10 : sum; }
+    bool soft() const { return ace & (sum <= 11); }  // bitwise: no short-circuit branch
+    int value() const { return sum + 10 * soft(); }
 };
 
 enum Action : uint8_t { HIT, STAND, DOUBLE, SPLIT, SURRENDER };
@@ -133,16 +134,32 @@ struct Stats {
     }
 };
 
-inline int floor_div(int a, int b) {  // b > 0
-    int q = a / b;
-    return (a % b != 0 && a < 0) ? q - 1 : q;
+inline int floor_div(int a, int b) {  // b > 0; branchless: truncation leaves r < 0 only when a < 0
+    int q = a / b, r = a % b;
+    return q - (r < 0);
 }
 
 // Bet ramp in units, keyed on floored true count: 1-12 spread.
 inline int bet_units(int tc) {
-    if (tc < 2) return 1;
-    int u = 2 * (tc - 1);
-    return u > 12 ? 12 : u;
+    static constexpr int8_t RAMP[8] = {1, 1, 2, 4, 6, 8, 10, 12};  // tc <= 1, 2, ..., >= 7
+    return RAMP[tc < 1 ? 1 : (tc > 7 ? 7 : tc)];
+}
+
+// ---------------------------------------------------------------- Strategy matrix
+// Every decision is one lookup in a [hand class][upcard][rule flags] table, then one exact
+// true-count compare: action = tc >= k ? alt : base. The table is generated from Sim::decide()
+// (the readable spec) by probing it across true counts, so the two can't drift apart.
+// Hand classes: hard total 0..21, soft 22..31 (sum with ace as 1 + 20), pair 32..41 (31 + rank).
+constexpr int NCLASS = 42, NFLAGS = 8;  // flags: double | split << 1 | surrender << 2
+
+struct Entry { uint8_t base, alt; int8_t k; };
+struct Table { Entry e[NCLASS][11][NFLAGS]; };  // ~11 KB, built once, shared read-only by all threads
+const Table& strategy_table(bool counting);
+
+inline int hand_class(const Hand& h) {
+    int pair = 31 + h.first, soft = 20 + h.sum, hard = h.sum;
+    bool is_pair = (h.ncards == 2) & (h.sum == 2 * h.first);
+    return is_pair ? pair : (h.soft() ? soft : hard);
 }
 
 // ---------------------------------------------------------------- Player
@@ -153,8 +170,16 @@ struct Sim {
     int unseen_extra = 0;   // 1 while the dealer's hole card is drawn but not yet seen
     bool counting = true;   // false = flat-bet basic strategy (for validation)
     Stats st;
+    const Table* table;
 
-    explicit Sim(uint64_t seed, bool counting_ = true) : rng(seed), counting(counting_) {}
+    explicit Sim(uint64_t seed, bool counting_ = true, bool with_table = true)
+        : rng(seed), counting(counting_), table(with_table ? &strategy_table(counting_) : nullptr) {}
+
+    // Table-driven equivalent of decide().
+    Action lookup(const Hand& h, int up, bool can_double, bool can_split, bool can_surrender) const {
+        const Entry& e = table->e[hand_class(h)][up][can_double | can_split << 1 | can_surrender << 2];
+        return (Action)(tc_ge(e.k) ? e.alt : e.base);
+    }
 
     int unseen() const { return CARDS - shoe.pos + unseen_extra; }
 
@@ -294,7 +319,7 @@ struct Sim {
                 if (h.value() >= 21) break;
                 bool two = h.ncards == 2;
                 // Split aces never reach here, so no resplitting aces falls out naturally.
-                Action a = decide(h, up, two, two && nh < MAX_HANDS, two && nh == 1);
+                Action a = lookup(h, up, two, two && nh < MAX_HANDS, two && nh == 1);
                 if (a == SURRENDER) { h.surrendered = true; break; }
                 if (a == STAND) break;
                 if (a == HIT) { h.add(draw_seen()); continue; }
@@ -334,12 +359,15 @@ struct Sim {
             const Hand& h = hands[i];
             int64_t w = B * h.bet_mult;
             int pv = h.value();
+            // Branchless settle: outcomes are random, so if-chains here mispredict constantly.
+            bool surr = h.surrendered, bust = !surr & (pv > 21);
+            bool win = !surr & !bust & ((dv > 21) | (pv > dv));
+            bool push = !surr & !bust & (dv <= 21) & (pv == dv);
+            bool loss = !surr & !win & !push;
+            net += w * ((int64_t)win - (int64_t)loss) - (surr ? B / 2 : 0);
             st.hands++;
-            if (h.surrendered) { net -= B / 2; st.surrenders++; st.losses++; }
-            else if (pv > 21) { net -= w; st.busts++; st.losses++; }
-            else if (dv > 21 || pv > dv) { net += w; st.wins++; }
-            else if (pv < dv) { net -= w; st.losses++; }
-            else st.pushes++;
+            st.wins += win; st.pushes += push; st.losses += loss | surr;
+            st.busts += bust; st.surrenders += surr;
         }
         finish(net, units, tc);
     }
@@ -355,5 +383,35 @@ struct Sim {
         st.tc_flat_net[b - TC_MIN] += flat;
     }
 };
+
+// Probe decide() at true counts -40..+40 (two decks unseen, rc = 2 * tc) for every hand class,
+// upcard and flag combination. Each cell must be a single step: base below k, alt at k and above.
+inline Table build_table(bool counting) {
+    Table t;
+    Sim probe(0, counting, false);
+    probe.shoe.pos = CARDS - 104;
+    probe.unseen_extra = 0;
+    for (int cls = 0; cls < NCLASS; cls++) {
+        Hand h;
+        if (cls >= 32) { int r = cls - 31; h.add((uint8_t)r); h.add((uint8_t)r); }
+        else if (cls >= 22) { h.sum = (uint8_t)(cls - 20); h.ace = true; h.ncards = 3; }
+        else { h.sum = (uint8_t)cls; h.ncards = 3; }
+        for (int up = 1; up <= 10; up++)
+            for (int f = 0; f < NFLAGS; f++) {
+                auto at = [&](int tc) { probe.rc = 2 * tc; return probe.decide(h, up, f & 1, f & 2, f & 4); };
+                Entry e{(uint8_t)at(-40), (uint8_t)at(40), 0};
+                if (e.base != e.alt) for (e.k = -40; at(e.k) != e.alt;) e.k++;
+                for (int tc = -40; tc <= 40; tc++)
+                    if (at(tc) != (tc >= e.k ? e.alt : e.base)) abort();  // not a single-step index
+                t.e[cls][up][f] = e;
+            }
+    }
+    return t;
+}
+
+inline const Table& strategy_table(bool counting) {
+    static const Table hilo = build_table(true), basic = build_table(false);
+    return counting ? hilo : basic;
+}
 
 }  // namespace bj

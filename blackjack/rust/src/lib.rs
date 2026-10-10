@@ -142,15 +142,16 @@ impl Hand {
     }
     #[inline(always)]
     pub fn soft(&self) -> bool {
-        self.ace && self.sum <= 11
+        self.ace & (self.sum <= 11) // bitwise: no short-circuit branch
     }
     #[inline(always)]
     pub fn value(&self) -> i32 {
-        if self.soft() { self.sum as i32 + 10 } else { self.sum as i32 }
+        self.sum as i32 + 10 * self.soft() as i32
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum Action {
     Hit,
     Stand,
@@ -219,7 +220,80 @@ impl Stats {
 
 /// Bet ramp in units, keyed on floored true count: 1-12 spread.
 pub fn bet_units(tc: i32) -> i32 {
-    if tc < 2 { 1 } else { (2 * (tc - 1)).min(12) }
+    const RAMP: [i8; 8] = [1, 1, 2, 4, 6, 8, 10, 12]; // tc <= 1, 2, ..., >= 7
+    RAMP[tc.clamp(1, 7) as usize] as i32
+}
+
+// ---------------------------------------------------------------- Strategy matrix
+// Every decision is one lookup in a [hand class][upcard][rule flags] table, then one exact
+// true-count compare: action = tc >= k ? alt : base. The table is generated from Sim::decide()
+// (the readable spec) by probing it across true counts, so the two can't drift apart.
+// Hand classes: hard total 0..21, soft 22..31 (sum with ace as 1 + 20), pair 32..41 (31 + rank).
+pub const NCLASS: usize = 42;
+pub const NFLAGS: usize = 8; // flags: double | split << 1 | surrender << 2
+
+#[derive(Clone, Copy)]
+pub struct Entry {
+    base: Action,
+    alt: Action,
+    k: i8,
+}
+
+/// ~11 KB, built once, shared read-only by all threads.
+pub struct Table {
+    e: [[[Entry; NFLAGS]; 11]; NCLASS],
+}
+
+#[inline(always)]
+fn hand_class(h: &Hand) -> usize {
+    let (pair, soft, hard) = (31 + h.first as usize, 20 + h.sum as usize, h.sum as usize);
+    let is_pair = (h.ncards == 2) & (h.sum == 2 * h.first);
+    if is_pair { pair } else if h.soft() { soft } else { hard }
+}
+
+/// Probe decide() at true counts -40..+40 (two decks unseen, rc = 2 * tc) for every hand class,
+/// upcard and flag combination. Each cell must be a single step: base below k, alt at k and above.
+fn build_table(counting: bool) -> Table {
+    let mut t = Table { e: [[[Entry { base: Hit, alt: Hit, k: 0 }; NFLAGS]; 11]; NCLASS] };
+    let mut probe = Sim::with_table(0, counting, None);
+    probe.shoe.pos = CARDS - 104;
+    for cls in 0..NCLASS {
+        let h = if cls >= 32 {
+            let r = (cls - 31) as u8;
+            Hand::from(&[r, r])
+        } else if cls >= 22 {
+            Hand { sum: (cls - 20) as u8, ace: true, ncards: 3, ..Hand::default() }
+        } else {
+            Hand { sum: cls as u8, ncards: 3, ..Hand::default() }
+        };
+        for up in 1..=10u8 {
+            for f in 0..NFLAGS {
+                let mut at = |tc: i32| {
+                    probe.rc = 2 * tc;
+                    probe.decide(&h, up, f & 1 != 0, f & 2 != 0, f & 4 != 0)
+                };
+                let mut e = Entry { base: at(-40), alt: at(40), k: 0 };
+                if e.base != e.alt {
+                    e.k = -40;
+                    while at(e.k as i32) != e.alt {
+                        e.k += 1;
+                    }
+                }
+                for tc in -40..=40 {
+                    let want = if tc >= e.k as i32 { e.alt } else { e.base };
+                    assert!(at(tc) == want, "not a single-step index");
+                }
+                t.e[cls][up as usize][f] = e;
+            }
+        }
+    }
+    t
+}
+
+pub fn strategy_table(counting: bool) -> &'static Table {
+    static HILO: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
+    static BASIC: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
+    if counting { HILO.get_or_init(|| build_table(true)) } else { BASIC.get_or_init(|| build_table(false)) }
 }
 
 // ---------------------------------------------------------------- Player
@@ -230,11 +304,24 @@ pub struct Sim {
     pub unseen_extra: i32, // 1 while the dealer's hole card is drawn but not yet seen
     pub counting: bool,    // false = flat-bet basic strategy (for validation)
     pub st: Stats,
+    table: Option<&'static Table>,
 }
 
 impl Sim {
     pub fn new(seed: u64, counting: bool) -> Self {
-        Sim { rng: Rng::new(seed), shoe: Shoe::default(), rc: 0, unseen_extra: 0, counting, st: Stats::default() }
+        Self::with_table(seed, counting, Some(strategy_table(counting)))
+    }
+
+    fn with_table(seed: u64, counting: bool, table: Option<&'static Table>) -> Self {
+        Sim { rng: Rng::new(seed), shoe: Shoe::default(), rc: 0, unseen_extra: 0, counting, st: Stats::default(), table }
+    }
+
+    /// Table-driven equivalent of decide().
+    #[inline(always)]
+    pub fn lookup(&self, h: &Hand, up: u8, can_double: bool, can_split: bool, can_surrender: bool) -> Action {
+        let flags = can_double as usize | (can_split as usize) << 1 | (can_surrender as usize) << 2;
+        let e = &self.table.unwrap().e[hand_class(h)][up as usize][flags];
+        if self.tc_ge(e.k as i32) { e.alt } else { e.base }
     }
 
     #[inline(always)]
@@ -434,7 +521,7 @@ impl Sim {
                 }
                 let two = h.ncards == 2;
                 // Split aces never reach here, so no resplitting aces falls out naturally.
-                match self.decide(&h, up, two, two && nh < MAX_HANDS, two && nh == 1) {
+                match self.lookup(&h, up, two, two && nh < MAX_HANDS, two && nh == 1) {
                     Surrender => {
                         h.surrendered = true;
                         break;
@@ -497,24 +584,20 @@ impl Sim {
         for h in &hands[..nh] {
             let w = b * h.bet_mult as i64;
             let pv = h.value();
-            self.st.hands += 1;
-            if h.surrendered {
-                net -= b / 2;
-                self.st.surrenders += 1;
-                self.st.losses += 1;
-            } else if pv > 21 {
-                net -= w;
-                self.st.busts += 1;
-                self.st.losses += 1;
-            } else if dv > 21 || pv > dv {
-                net += w;
-                self.st.wins += 1;
-            } else if pv < dv {
-                net -= w;
-                self.st.losses += 1;
-            } else {
-                self.st.pushes += 1;
-            }
+            // Branchless settle: outcomes are random, so if-chains here mispredict constantly.
+            let surr = h.surrendered;
+            let bust = !surr & (pv > 21);
+            let win = !surr & !bust & ((dv > 21) | (pv > dv));
+            let push = !surr & !bust & (dv <= 21) & (pv == dv);
+            let loss = !surr & !win & !push;
+            net += w * (win as i64 - loss as i64) - if surr { b / 2 } else { 0 };
+            let st = &mut self.st;
+            st.hands += 1;
+            st.wins += win as u64;
+            st.pushes += push as u64;
+            st.losses += (loss | surr) as u64;
+            st.busts += bust as u64;
+            st.surrenders += surr as u64;
         }
         self.finish(net, units, tc);
     }
@@ -648,6 +731,22 @@ mod tests {
             assert_eq!(at_tc(index).decide(&h, up, two, true, surr), at, "{cards:?} v {up} at");
         }
         assert_eq!(at_tc(-1).decide(&Hand::from(&[10, 5]), 10, true, true, true), Hit);
+    }
+
+    #[test]
+    fn table_matches_decide_in_play() {
+        for counting in [true, false] {
+            let mut s = Sim::new(5, counting);
+            for _ in 0..20_000 {
+                s.play_round();
+                let up = (s.rng.below(10) + 1) as u8;
+                let h = Hand::from(&[(s.rng.below(10) + 1) as u8, (s.rng.below(10) + 1) as u8]);
+                for f in 0..8 {
+                    let (d, p, u) = (f & 1 != 0, f & 2 != 0, f & 4 != 0);
+                    assert_eq!(s.lookup(&h, up, d, p, u), s.decide(&h, up, d, p, u));
+                }
+            }
+        }
     }
 
     #[test]

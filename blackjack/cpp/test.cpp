@@ -122,6 +122,17 @@ int main() {
         Sim lo = at_tc(-1);  // 15v10 surrender index is 0
         CHECK(lo.decide(mk({10, 5}), 10, true, true, true) == HIT);
     }
+    // The strategy matrix agrees with decide() at every flag combination, over counts seen in play.
+    for (bool counting : {true, false}) {
+        Sim s(5, counting);
+        for (int i = 0; i < 20000; i++) {
+            s.play_round();
+            int up = (int)s.rng.below(10) + 1;
+            Hand h = mk({(int)s.rng.below(10) + 1, (int)s.rng.below(10) + 1});
+            for (int f = 0; f < 8; f++)
+                CHECK(s.lookup(h, up, f & 1, f & 2, f & 4) == s.decide(h, up, f & 1, f & 2, f & 4));
+        }
+    }
     // Basic mode ignores the count.
     {
         Sim s(1, false);
