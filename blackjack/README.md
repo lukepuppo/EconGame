@@ -53,8 +53,8 @@ basic-strategy figure matches the published house edge for these rules (about 0.
 |---|---|---|
 | First version (scalar, if-chain strategy) | 11 M rounds/s | 2.28 s |
 | Scalar + strategy matrix (today's `ref` engine) | 14 M rounds/s | ~1.8 s |
-| **AVX-512 lockstep engine, C++ (clang 18)** | **65 M rounds/s** | **0.39–0.48 s** (typically ~0.40) |
-| **AVX-512 lockstep engine, Rust 1.97** | **57 M rounds/s** | **0.42–0.49 s** (typically ~0.44) |
+| **AVX-512 lockstep engine, C++ (clang 18)** | **58–65 M rounds/s** | **0.39–0.48 s** (typically ~0.40) |
+| **AVX-512 lockstep engine, Rust 1.97** | **50–59 M rounds/s** | **0.42–0.49 s** (typically ~0.44) |
 
 The 4-thread ranges are 10 consecutive runs each. Times on this VM vary by about ±10% from run
 to run, so use `bench.sh` to compare builds. C++ is
