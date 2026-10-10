@@ -43,6 +43,50 @@ inline const FlatTable& flat_table(bool counting) {
     return counting ? hilo : basic;
 }
 
+// Hit-or-stand rule for hands of 3+ cards (no double, split or surrender), derived from the
+// strategy matrix: stand iff value >= S, where for hard hands S = hard[up] minus one for each
+// breakpoint b1[up], b2[up] with tc >= b, and for soft hands S = soft[up]. The builder checks the
+// matrix really has this shape at every true count from -40 to +40. In the engine, tc >= b is
+// kept as D_b = rc * 52 - b * unseen >= 0, updated by adds on every draw, so a hit-loop decision
+// needs no gather and no multiply.
+struct HitRule {
+    alignas(64) int32_t hard[16] = {}, soft[16] = {}, b1[16] = {}, b2[16] = {};
+    static constexpr int NEVER = 1000;  // breakpoint no count reaches
+    explicit HitRule(const Table& t) {
+        auto stands = [&](int cls, int up, int tc) {
+            const Entry& e = t.e[cls][up][0];
+            return (tc >= e.k ? e.alt : e.base) == STAND;
+        };
+        // Smallest value from which every higher value stands (and every lower one hits).
+        auto threshold = [&](int first_cls, int lo, int hi, int up, int tc) {
+            int S = hi + 1;
+            for (int v = hi; v >= lo && stands(first_cls + v - lo, up, tc); v--) S = v;
+            for (int v = lo; v < S; v++)
+                if (stands(first_cls + v - lo, up, tc)) abort();  // not a threshold rule
+            return S;
+        };
+        for (int up = 1; up <= 10; up++) {
+            int prev = threshold(4, 4, 21, up, -40), steps = 0;
+            hard[up] = prev;
+            b1[up] = b2[up] = NEVER;
+            int sft = threshold(22, 12, 21, up, -40);  // soft classes 22..31 = soft 12..21
+            soft[up] = sft;
+            for (int tc = -39; tc <= 40; tc++) {
+                if (threshold(22, 12, 21, up, tc) != sft) abort();  // soft play must not depend on the count
+                int S = threshold(4, 4, 21, up, tc);
+                if (S > prev) abort();  // a higher count must never mean standing less
+                for (; prev > S; prev--, steps++) (steps == 0 ? b1 : b2)[up] = tc;
+                if (steps > 2) abort();
+            }
+        }
+    }
+};
+
+inline const HitRule& hit_rule(bool counting) {
+    static const HitRule hilo(strategy_table(true)), basic(strategy_table(false));
+    return counting ? hilo : basic;
+}
+
 #ifdef __AVX512F__
 
 template <int G>
@@ -53,11 +97,14 @@ struct Engine {
     const int32_t* table;
 
     // Vector-path counters, per lane, flushed into lanes[l].st every FLUSH rounds (int32 safe).
-    static constexpr int FLUSH = 1 << 14, NACC = 19;
+    static constexpr int FLUSH = 1 << 12, NACC = 19;
     enum { ROUNDS, HANDS, NET, INIT, ACTION, NETSQ, FLAT, FLATSQ, WINS, LOSSES, PUSHES, PBJ, DBJ, DOUBLES, SURR,
            BUSTS, INS, INSW, SPLITS };
     alignas(64) int32_t acc[G][NACC][VLANES] = {};
-    alignas(64) int32_t hist_rounds[LANES * TC_BUCKETS] = {}, hist_flat[LANES * TC_BUCKETS] = {};
+    // True-count histogram per lane and bucket, packed: rounds << 19 plus the signed flat-net sum
+    // (|sum| < 2^18 and rounds < 2^12 between flushes), so one gather + scatter updates both.
+    static constexpr int HIST_SHIFT = 19;
+    alignas(64) int32_t hist[LANES * TC_BUCKETS] = {};
 
     Engine(Sim* l, bool c) : lanes(l), counting(c), table(flat_table(c).e) {}
 
@@ -76,9 +123,11 @@ struct Engine {
             st.busts += (uint32_t)a[BUSTS][k]; st.ins_taken += (uint32_t)a[INS][k]; st.ins_won += (uint32_t)a[INSW][k];
             st.splits += (uint32_t)a[SPLITS][k];
             for (int b = 0; b < TC_BUCKETS; b++) {
-                st.tc_rounds[b] += (uint32_t)hist_rounds[l * TC_BUCKETS + b];
-                st.tc_flat_net[b] += hist_flat[l * TC_BUCKETS + b];
-                hist_rounds[l * TC_BUCKETS + b] = hist_flat[l * TC_BUCKETS + b] = 0;
+                int32_t v = hist[l * TC_BUCKETS + b];
+                int32_t flat = ((v + (1 << (HIST_SHIFT - 1))) & ((1 << HIST_SHIFT) - 1)) - (1 << (HIST_SHIFT - 1));
+                st.tc_rounds[b] += (uint32_t)(v - flat) >> HIST_SHIFT;
+                st.tc_flat_net[b] += flat;
+                hist[l * TC_BUCKETS + b] = 0;
             }
         }
         memset(acc, 0, sizeof acc);
@@ -127,6 +176,12 @@ struct Engine {
             __mmask16 ge = tc_ge(g, _mm512_srai_epi32(e, 16));
             return _mm512_mask_blend_epi32(ge, _mm512_and_si512(e, BYTE), _mm512_and_si512(_mm512_srli_epi32(e, 8), BYTE));
         };
+        // Hit rule vectors (indexed by upcard) and per-lane breakpoint distances D_b.
+        const HitRule& hr = hit_rule(counting);
+        const __m512i HR_HARD = _mm512_load_si512(hr.hard), HR_SOFT = _mm512_load_si512(hr.soft);
+        const __m512i HR_B1 = _mm512_load_si512(hr.b1), HR_B2 = _mm512_load_si512(hr.b2);
+        const __m512i HILO52 = _mm512_mullo_epi32(HILO_V, splat(52));
+        __m512i b1[G], b2[G], d1[G], d2[G], stand_hard[G], stand_soft[G];
         // Masked draw of one card per lane in m, from the card window while it has cards left.
         auto draw = [&](int g, __mmask16 m) {
             __m512i c = _mm512_and_si512(win1[g], BYTE);
@@ -137,6 +192,10 @@ struct Engine {
             left[g] = _mm512_mask_sub_epi32(left[g], m, left[g], ONE);
             pos[g] = _mm512_mask_add_epi32(pos[g], m, pos[g], ONE);
             rc[g] = _mm512_mask_add_epi32(rc[g], m, rc[g], hilo(c));
+            // D_b = rc*52 - b*unseen: a draw adds 52*hilo(c) to rc*52 and takes 1 from unseen.
+            __m512i h52 = _mm512_permutexvar_epi32(c, HILO52);
+            d1[g] = _mm512_mask_add_epi32(d1[g], m, d1[g], _mm512_add_epi32(h52, b1[g]));
+            d2[g] = _mm512_mask_add_epi32(d2[g], m, d2[g], _mm512_add_epi32(h52, b2[g]));
             return c;
         };
         auto value = [&](__m512i sum, __mmask16 ace) {
@@ -182,10 +241,14 @@ struct Engine {
             ace |= dr & _mm512_cmpeq_epi32_mask(c, ONE);
             return dbl;
         };
-        // One hit-loop step for multi-card hands (they can only hit or stand).
+        // One hit-loop step for multi-card hands (they can only hit or stand): see HitRule.
         auto hit_step = [&](int g, __m512i& sum, __mmask16& ace) {
-            __mmask16 m = more[g] & _mm512_cmplt_epi32_mask(value(sum, ace), splat(21));
-            if (m) m &= _mm512_cmpeq_epi32_mask(lookup(g, m, hand_cls(sum, ace, 0, ZERO), up[g], 0), splat(HIT));
+            __mmask16 sft = ace & _mm512_cmple_epi32_mask(sum, splat(11));
+            __m512i val = _mm512_mask_add_epi32(sum, sft, sum, splat(10));
+            __m512i S = _mm512_mask_sub_epi32(stand_hard[g], _mm512_cmpge_epi32_mask(d1[g], ZERO), stand_hard[g], ONE);
+            S = _mm512_mask_sub_epi32(S, _mm512_cmpge_epi32_mask(d2[g], ZERO), S, ONE);
+            S = _mm512_mask_mov_epi32(S, sft, stand_soft[g]);
+            __mmask16 m = more[g] & _mm512_cmplt_epi32_mask(val, splat(21)) & _mm512_cmplt_epi32_mask(val, S);
             if (m) {
                 __m512i c = draw(g, m);
                 sum = _mm512_mask_add_epi32(sum, m, sum, c);
@@ -224,6 +287,10 @@ struct Engine {
                 win1[g] = _mm512_i32gather_epi32(_mm512_add_epi32(at, splat(4)), base, 1);
                 win2[g] = _mm512_i32gather_epi32(_mm512_add_epi32(at, splat(8)), base, 1);
                 left[g] = splat(8);
+                b1[g] = _mm512_permutexvar_epi32(_mm512_and_si512(_mm512_srli_epi32(w, 8), BYTE), HR_B1);
+                b2[g] = _mm512_permutexvar_epi32(_mm512_and_si512(_mm512_srli_epi32(w, 8), BYTE), HR_B2);
+                stand_hard[g] = _mm512_permutexvar_epi32(_mm512_and_si512(_mm512_srli_epi32(w, 8), BYTE), HR_HARD);
+                stand_soft[g] = _mm512_permutexvar_epi32(_mm512_and_si512(_mm512_srli_epi32(w, 8), BYTE), HR_SOFT);
                 c1[g] = _mm512_and_si512(w, BYTE);
                 up[g] = _mm512_and_si512(_mm512_srli_epi32(w, 8), BYTE);
                 __m512i c2 = _mm512_and_si512(_mm512_srli_epi32(w, 16), BYTE);
@@ -240,6 +307,12 @@ struct Engine {
                 net[g] = ZERO;
                 action[g] = B[g];
 
+                {  // D_b after the deal (hole card unseen); draw() keeps it current
+                    __m512i rc52 = _mm512_mullo_epi32(rc[g], splat(52));
+                    __m512i unseen_now = _mm512_sub_epi32(splat(CARDS + 1), pos[g]);
+                    d1[g] = _mm512_sub_epi32(rc52, _mm512_mullo_epi32(b1[g], unseen_now));
+                    d2[g] = _mm512_sub_epi32(rc52, _mm512_mullo_epi32(b2[g], unseen_now));
+                }
                 ins[g] = counting ? (up_ace[g] & tc_ge(g, splat(3))) : 0;
                 net[g] = _mm512_mask_add_epi32(net[g], ins[g] & dbj[g], net[g], B[g]);
                 net[g] = _mm512_mask_sub_epi32(net[g], ins[g] & ~dbj[g], net[g], halfB[g]);
@@ -336,10 +409,9 @@ struct Engine {
                 inc(g, INS, ins[g] & vec); inc(g, INSW, ins[g] & dbj[g]);
                 // Per-lane histogram: indices are distinct per lane, so no scatter conflicts.
                 __m512i hidx = _mm512_add_epi32(_mm512_mullo_epi32(_mm512_add_epi32(LANE_IDX, splat(g * VLANES)), splat(TC_BUCKETS)), bucket[g]);
-                __m512i hr = _mm512_mask_i32gather_epi32(ZERO, vec, hidx, hist_rounds, 4);
-                _mm512_mask_i32scatter_epi32(hist_rounds, vec, hidx, _mm512_add_epi32(hr, ONE), 4);
-                __m512i hf = _mm512_mask_i32gather_epi32(ZERO, vec, hidx, hist_flat, 4);
-                _mm512_mask_i32scatter_epi32(hist_flat, vec, hidx, _mm512_add_epi32(hf, flat), 4);
+                __m512i hv = _mm512_mask_i32gather_epi32(ZERO, vec, hidx, hist, 4);
+                hv = _mm512_add_epi32(hv, _mm512_add_epi32(flat, splat(1 << HIST_SHIFT)));
+                _mm512_mask_i32scatter_epi32(hist, vec, hidx, hv, 4);
 
                 // Re-split lanes: rewind to the start of the round and replay on the scalar engine.
                 if (resplit[g]) {

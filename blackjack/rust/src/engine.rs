@@ -37,7 +37,68 @@ fn flat_table(counting: bool) -> &'static [i32] {
     if counting { HILO.get_or_init(|| build(true)) } else { BASIC.get_or_init(|| build(false)) }
 }
 
-const FLUSH: u64 = 1 << 14;
+/// Hit-or-stand rule for hands of 3+ cards (no double, split or surrender), derived from the
+/// strategy matrix: stand iff value >= S, where for hard hands S = hard[up] minus one for each
+/// breakpoint b1[up], b2[up] with tc >= b, and for soft hands S = soft[up]. The builder checks the
+/// matrix really has this shape at every true count from -40 to +40. In the engine, tc >= b is
+/// kept as D_b = rc * 52 - b * unseen >= 0, updated by adds on every draw, so a hit-loop decision
+/// needs no gather and no multiply.
+struct HitRule {
+    hard: [i32; 16],
+    soft: [i32; 16],
+    b1: [i32; 16],
+    b2: [i32; 16],
+}
+
+const NEVER: i32 = 1000; // breakpoint no count reaches
+
+fn hit_rule(counting: bool) -> &'static HitRule {
+    static HILO: OnceLock<HitRule> = OnceLock::new();
+    static BASIC: OnceLock<HitRule> = OnceLock::new();
+    let build = |c: bool| {
+        let t = strategy_table(c);
+        let stands = |cls: usize, up: usize, tc: i32| {
+            let (base, alt, k) = t.entry(cls, up, 0);
+            (if tc >= k as i32 { alt } else { base }) == Action::Stand as u8
+        };
+        // Smallest value from which every higher value stands (and every lower one hits).
+        let threshold = |first_cls: usize, lo: i32, hi: i32, up: usize, tc: i32| {
+            let mut s = hi + 1;
+            let mut v = hi;
+            while v >= lo && stands(first_cls + (v - lo) as usize, up, tc) {
+                s = v;
+                v -= 1;
+            }
+            assert!((lo..s).all(|v| !stands(first_cls + (v - lo) as usize, up, tc)), "not a threshold rule");
+            s
+        };
+        let mut r = HitRule { hard: [0; 16], soft: [0; 16], b1: [NEVER; 16], b2: [NEVER; 16] };
+        for up in 1..=10 {
+            let mut prev = threshold(4, 4, 21, up, -40);
+            let mut steps = 0;
+            r.hard[up] = prev;
+            r.soft[up] = threshold(22, 12, 21, up, -40); // soft classes 22..31 = soft 12..21
+            for tc in -39..=40 {
+                assert_eq!(threshold(22, 12, 21, up, tc), r.soft[up], "soft play must not depend on the count");
+                let s = threshold(4, 4, 21, up, tc);
+                assert!(s <= prev, "a higher count must never mean standing less");
+                while prev > s {
+                    if steps == 0 { r.b1[up] = tc } else { r.b2[up] = tc }
+                    prev -= 1;
+                    steps += 1;
+                }
+                assert!(steps <= 2);
+            }
+        }
+        r
+    };
+    if counting { HILO.get_or_init(|| build(true)) } else { BASIC.get_or_init(|| build(false)) }
+}
+
+const FLUSH: u64 = 1 << 12;
+/// True-count histogram cells pack rounds << 19 plus the signed flat-net sum (|sum| < 2^18 and
+/// rounds < 2^12 between flushes), so one gather + scatter updates both.
+const HIST_SHIFT: i32 = 19;
 const NACC: usize = 19;
 const ROUNDS: usize = 0;
 const HANDS: usize = 1;
@@ -69,8 +130,7 @@ pub struct Engine<'a, const G: usize> {
     counting: bool,
     table: &'static [i32],
     acc: [[[i32; VLANES]; NACC]; G], // per group
-    hist_rounds: Vec<i32>,           // per lane x bucket
-    hist_flat: Vec<i32>,
+    hist: Vec<i32>, // per lane x bucket, packed (see HIST_SHIFT)
     base: *const u8,
     // per-group state
     off: [__m512i; G],
@@ -86,6 +146,14 @@ pub struct Engine<'a, const G: usize> {
     ace: [[__mmask16; G]; 2],
     act: [[__m512i; G]; 2],
     sp_aces: [__mmask16; G],
+    // hit rule per lane (by upcard) and breakpoint distances D_b = rc*52 - b*unseen
+    b1: [__m512i; G],
+    b2: [__m512i; G],
+    d1: [__m512i; G],
+    d2: [__m512i; G],
+    stand_hard: [__m512i; G],
+    stand_soft: [__m512i; G],
+    rule: &'static HitRule,
     resplit: [__mmask16; G],
     more: [__mmask16; G],
 }
@@ -102,8 +170,7 @@ impl<'a, const G: usize> Engine<'a, G> {
             counting,
             table: flat_table(counting),
             acc: [[[0; VLANES]; NACC]; G],
-            hist_rounds: vec![0; Self::LANES * TC_BUCKETS],
-            hist_flat: vec![0; Self::LANES * TC_BUCKETS],
+            hist: vec![0; Self::LANES * TC_BUCKETS],
             base,
             off: [z; G],
             pos: [z; G],
@@ -117,6 +184,13 @@ impl<'a, const G: usize> Engine<'a, G> {
             ace: [[0; G]; 2],
             act: [[z; G]; 2],
             sp_aces: [0; G],
+            b1: [z; G],
+            b2: [z; G],
+            d1: [z; G],
+            d2: [z; G],
+            stand_hard: [z; G],
+            stand_soft: [z; G],
+            rule: hit_rule(counting),
             resplit: [0; G],
             more: [0; G],
         }
@@ -148,10 +222,12 @@ impl<'a, const G: usize> Engine<'a, G> {
             st.ins_won += u(a[INSW][k]);
             st.splits += u(a[SPLITS][k]);
             for b in 0..TC_BUCKETS {
-                st.tc_rounds[b] += u(self.hist_rounds[l * TC_BUCKETS + b]);
-                st.tc_flat_net[b] += self.hist_flat[l * TC_BUCKETS + b] as i64;
-                self.hist_rounds[l * TC_BUCKETS + b] = 0;
-                self.hist_flat[l * TC_BUCKETS + b] = 0;
+                let v = self.hist[l * TC_BUCKETS + b];
+                let half = 1 << (HIST_SHIFT - 1);
+                let flat = ((v + half) & ((1 << HIST_SHIFT) - 1)) - half;
+                st.tc_rounds[b] += (v.wrapping_sub(flat) as u32 >> HIST_SHIFT) as u64;
+                st.tc_flat_net[b] += flat as i64;
+                self.hist[l * TC_BUCKETS + b] = 0;
             }
         }
         for a in self.acc.iter_mut() {
@@ -219,6 +295,10 @@ impl<'a, const G: usize> Engine<'a, G> {
             self.left[g] = _mm512_mask_sub_epi32(self.left[g], m, self.left[g], one);
             self.pos[g] = _mm512_mask_add_epi32(self.pos[g], m, self.pos[g], one);
             self.rc[g] = _mm512_mask_add_epi32(self.rc[g], m, self.rc[g], Self::hilo(c));
+            // D_b = rc*52 - b*unseen: a draw adds 52*hilo(c) to rc*52 and takes 1 from unseen.
+            let h52 = _mm512_permutexvar_epi32(c, _mm512_setr_epi32(0, -52, 52, 52, 52, 52, 52, 0, 0, 0, -52, 0, 0, 0, 0, 0));
+            self.d1[g] = _mm512_mask_add_epi32(self.d1[g], m, self.d1[g], _mm512_add_epi32(h52, self.b1[g]));
+            self.d2[g] = _mm512_mask_add_epi32(self.d2[g], m, self.d2[g], _mm512_add_epi32(h52, self.b2[g]));
             c
         }
     }
@@ -267,16 +347,20 @@ impl<'a, const G: usize> Engine<'a, G> {
             dbl
         }
     }
-    /// One hit-loop step for multi-card hands (they can only hit or stand).
+    /// One hit-loop step for multi-card hands (they can only hit or stand): see HitRule.
     #[inline(always)]
     fn hit_step(&mut self, g: usize, h: usize) {
         unsafe {
             let (sum, ace) = (self.sum[h][g], self.ace[h][g]);
-            let mut m = self.more[g] & _mm512_cmplt_epi32_mask(Self::value(sum, ace), splat(21));
-            if m != 0 {
-                let cls = Self::hand_cls(sum, ace, 0, _mm512_setzero_si512());
-                m &= _mm512_cmpeq_epi32_mask(self.lookup(g, m, cls, 0), splat(Action::Hit as i32));
-            }
+            let one = splat(1);
+            let zero = _mm512_setzero_si512();
+            let sft = ace & _mm512_cmple_epi32_mask(sum, splat(11));
+            let val = _mm512_mask_add_epi32(sum, sft, sum, splat(10));
+            let mut s = self.stand_hard[g];
+            s = _mm512_mask_sub_epi32(s, _mm512_cmpge_epi32_mask(self.d1[g], zero), s, one);
+            s = _mm512_mask_sub_epi32(s, _mm512_cmpge_epi32_mask(self.d2[g], zero), s, one);
+            s = _mm512_mask_mov_epi32(s, sft, self.stand_soft[g]);
+            let m = self.more[g] & _mm512_cmplt_epi32_mask(val, splat(21)) & _mm512_cmplt_epi32_mask(val, s);
             if m != 0 {
                 let c = self.draw(g, m);
                 self.sum[h][g] = _mm512_mask_add_epi32(sum, m, sum, c);
@@ -398,6 +482,12 @@ impl<'a, const G: usize> Engine<'a, G> {
                 self.win1[g] = _mm512_i32gather_epi32::<1>(_mm512_add_epi32(at, splat(4)), bp);
                 self.win2[g] = _mm512_i32gather_epi32::<1>(_mm512_add_epi32(at, splat(8)), bp);
                 self.left[g] = splat(8);
+                let upv = _mm512_and_si512(_mm512_srli_epi32::<8>(w), byte);
+                let ld = |a: &[i32; 16]| _mm512_loadu_si512(a.as_ptr() as *const __m512i);
+                self.b1[g] = _mm512_permutexvar_epi32(upv, ld(&self.rule.b1));
+                self.b2[g] = _mm512_permutexvar_epi32(upv, ld(&self.rule.b2));
+                self.stand_hard[g] = _mm512_permutexvar_epi32(upv, ld(&self.rule.hard));
+                self.stand_soft[g] = _mm512_permutexvar_epi32(upv, ld(&self.rule.soft));
                 let c1 = _mm512_and_si512(w, byte);
                 self.c1[g] = c1;
                 self.up[g] = _mm512_and_si512(_mm512_srli_epi32::<8>(w), byte);
@@ -415,6 +505,13 @@ impl<'a, const G: usize> Engine<'a, G> {
                 net[g] = zero;
                 action[g] = bb[g];
 
+                {
+                    // D_b after the deal (hole card unseen); draw() keeps it current
+                    let rc52 = _mm512_mullo_epi32(self.rc[g], splat(52));
+                    let unseen_now = _mm512_sub_epi32(splat(CARDS as i32 + 1), self.pos[g]);
+                    self.d1[g] = _mm512_sub_epi32(rc52, _mm512_mullo_epi32(self.b1[g], unseen_now));
+                    self.d2[g] = _mm512_sub_epi32(rc52, _mm512_mullo_epi32(self.b2[g], unseen_now));
+                }
                 ins[g] = if self.counting { up_ace[g] & self.tc_ge(g, splat(3)) } else { 0 };
                 net[g] = _mm512_mask_add_epi32(net[g], ins[g] & dbj[g], net[g], bb[g]);
                 net[g] = _mm512_mask_sub_epi32(net[g], ins[g] & !dbj[g], net[g], half_b);
@@ -546,10 +643,9 @@ impl<'a, const G: usize> Engine<'a, G> {
                     _mm512_mullo_epi32(_mm512_add_epi32(lane_idx, splat((g * VLANES) as i32)), splat(TC_BUCKETS as i32)),
                     bucket[g],
                 );
-                let hr = _mm512_mask_i32gather_epi32::<4>(zero, vec, hidx, self.hist_rounds.as_ptr());
-                _mm512_mask_i32scatter_epi32::<4>(self.hist_rounds.as_mut_ptr(), vec, hidx, _mm512_add_epi32(hr, one));
-                let hf = _mm512_mask_i32gather_epi32::<4>(zero, vec, hidx, self.hist_flat.as_ptr());
-                _mm512_mask_i32scatter_epi32::<4>(self.hist_flat.as_mut_ptr(), vec, hidx, _mm512_add_epi32(hf, flat));
+                let hv = _mm512_mask_i32gather_epi32::<4>(zero, vec, hidx, self.hist.as_ptr());
+                let hv = _mm512_add_epi32(hv, _mm512_add_epi32(flat, splat(1 << HIST_SHIFT)));
+                _mm512_mask_i32scatter_epi32::<4>(self.hist.as_mut_ptr(), vec, hidx, hv);
 
                 // Re-split lanes: rewind to the start of the round and replay on the scalar engine.
                 let rs = self.resplit[g];

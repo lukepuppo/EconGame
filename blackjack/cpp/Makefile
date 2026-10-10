@@ -13,7 +13,7 @@ test: test.cpp bj.hpp engine.hpp
 	$(TESTCXX) -O2 -g -march=native -std=c++17 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -o bj_test test.cpp
 	./bj_test
 
-# Performance goal: 100M rounds in under 0.5 s on all cores (median of 5 runs).
+# Performance goal: every one of 10 runs of 100M rounds on all cores under 0.5 s.
 perf: bj
 	../perf_test.sh ./bj 0.5
 

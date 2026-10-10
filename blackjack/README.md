@@ -1,8 +1,8 @@
 # Blackjack Hi-Lo simulator (C++ vs Rust)
 
 Simulates 100,000,000 rounds of 6-deck blackjack played with perfect Hi-Lo advantage play in
-**about 0.44 s (C++) and 0.46 s (Rust) on a 4-core cloud VM**. That's 210-230M rounds per second,
-about 21× the first version. C++ and Rust each have two engines: an AVX-512 "lockstep" engine
+**about 0.40 s (C++) and 0.44 s (Rust) on a 4-core cloud VM**, with every run under 0.5 s. That's
+about 230-250M rounds per second, roughly 23× the first version. C++ and Rust each have two engines: an AVX-512 "lockstep" engine
 that plays 16 games per vector instruction, and a scalar reference engine. All four produce
 byte-identical results for the same seed.
 
@@ -10,7 +10,7 @@ byte-identical results for the same seed.
 ./compare.sh [rounds=100000000] [threads=nproc] [seed=1]  # build, check C++ == Rust == reference, time
 make -C cpp test                 # C++ suite (AddressSanitizer + UBSan)
 (cd rust && cargo test --release)
-make -C cpp perf                 # performance test: median of 5 runs of 100M rounds must be < 0.5 s
+make -C cpp perf                 # performance test: all 10 runs of 100M rounds must be < 0.5 s
 ./perf_test.sh ./rust/target/release/bj 0.5
 ./bench.sh 9 binA binB           # compare builds fairly on a noisy machine (min and median)
 ./cpp/bj 100000000 4 1 basic     # flat-bet basic strategy baseline
@@ -53,10 +53,11 @@ basic-strategy figure matches the published house edge for these rules (about 0.
 |---|---|---|
 | First version (scalar, if-chain strategy) | 11 M rounds/s | 2.28 s |
 | Scalar + strategy matrix (today's `ref` engine) | 14 M rounds/s | ~1.8 s |
-| **AVX-512 lockstep engine, C++ (clang 18)** | **62 M rounds/s** | **0.44 s** |
-| **AVX-512 lockstep engine, Rust 1.97** | **51 M rounds/s** | **0.46 s** |
+| **AVX-512 lockstep engine, C++ (clang 18)** | **65 M rounds/s** | **0.39–0.48 s** (typically ~0.40) |
+| **AVX-512 lockstep engine, Rust 1.97** | **57 M rounds/s** | **0.42–0.49 s** (typically ~0.44) |
 
-Medians on this VM vary by about ±10% between runs, so use `bench.sh` to compare builds. C++ is
+The 4-thread ranges are 10 consecutive runs each. Times on this VM vary by about ±10% from run
+to run, so use `bench.sh` to compare builds. C++ is
 built with clang because GCC 13 was ~10% slower on the vector engine.
 
 ### How it gets there, and where the ideas come from
@@ -88,12 +89,19 @@ built with clang because GCC 13 was ~10% slower on the vector engine.
    [simd-rand](https://github.com/ashayp22/simd-rand). A single stream is a serial chain at ~5
    cycles per step. The ++ scrambler avoids 64-bit vector multiplies (`vpmullq`, ~15-cycle
    latency on Intel).
-5. **Card window.** The 8 cards after the deal are gathered alongside it, so later draws are
+5. **Hit rule without lookups.** For hands of three or more cards the only choices are hit and
+   stand. The strategy matrix reduces to "stand iff value ≥ S(upcard)", where S drops by one at up
+   to two true-count breakpoints, and the builder asserts this shape. Each breakpoint test
+   `tc ≥ b` is kept as `rc·52 − b·unseen ≥ 0` and updated with two adds per card. That takes a
+   table gather and two 10-cycle multiplies off every hit decision (~4%).
+6. **Card window.** The 8 cards after the deal are gathered alongside it, so later draws are
    register byte-shifts (~3 cycles) instead of dependent gathers (~20+).
-6. **Interleaving independent groups.** The round is latency-bound, so three 16-lane groups
+7. **Interleaving independent groups.** The round is latency-bound, so three 16-lane groups
    advance phase by phase in turn and their dependency chains overlap (software pipelining).
    One group gives 52M rounds/s on one thread; three give 62M.
-7. **Deterministic dynamic scheduling.** The work is 128 lane sets with fixed seeds and round
+8. **Packed histogram.** Each lane's true-count histogram cell holds the round count in its high
+   bits and the flat-net sum in its low 19 bits, so one gather+scatter updates both (~3%).
+9. **Deterministic dynamic scheduling.** The work is 128 lane sets with fixed seeds and round
    counts, handed out to threads from an atomic counter, so one slow core doesn't hold up the
    run. Output is the same for any thread count.
 
@@ -106,6 +114,9 @@ time and the vector round ~60%.
 |---|---|
 | Vectorized shoe generation (16 shoes at once, sequential sampling from rank counts) | Same cost as Fisher-Yates (~1.1 ns/card), more complex |
 | Shuffling in the background between vector phases | Slower: the swaps compete with gathers for load ports |
+| Interleaving two shoes' Fisher-Yates swaps | Slower: the swap loop is load/store-port bound (~1.8 cycles/card) |
+| Shuffling only dealt cards (lazy tail) | Slower: the extra branch in the hot draw path costs more than the saved swaps |
+| Building the shuffle's swap targets straight from registers | No measurable change |
 | Event counters as scalar popcounts | Slower |
 | Branch-free first loop iterations | No change |
 | GCC profile-guided optimization | ~3% gain, within noise |
@@ -123,7 +134,7 @@ The C++ suite runs under AddressSanitizer + UBSan; both languages run the same c
 | Chi-square uniformity of ranks at several positions; shoe composition and Hi-Lo balance | Shuffle quality |
 | Every Illustrious 18 / Fab 4 index at its threshold; basic strategy spot checks; strategy matrix ≡ `decide()` | Strategy |
 | Running count ≡ cards dealt; basic-strategy and Hi-Lo edges within the published range | End-to-end sanity |
-| `perf_test.sh`: 100M rounds, median of 5, under 0.5 s | The speed goal |
+| `perf_test.sh`: 100M rounds, 10 runs, every one under 0.5 s | The speed goal |
 
 Bugs these tests caught while building the vector engine:
 - An aligned 256-bit store to an unaligned address, after a rare scalar step in the shuffle. Only
